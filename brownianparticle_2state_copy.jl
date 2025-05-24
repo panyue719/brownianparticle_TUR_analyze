@@ -15,7 +15,6 @@ using Plots
 using Random
 using JSON
 using Printf # For @sprintf
-using Statistics  # 用于计算统计量
 
 # Ensure GKSwstype is set for headless environments if needed
 ENV["GKSwstype"] = "100"
@@ -28,7 +27,7 @@ data_root = "" # As per user's snippet, ensures local output
 println("Data root (as per user preference): '$data_root'") 
 tt = 0.5052622965408168 #ms/[t]
 g_gravity_example = 10.0 #um/ms^2 (from user snippet, currently unused in script logic)
-projectname = "brownianparticle_2state_0.5" # From user snippet, for output directory AND config
+projectname = "brownianparticle_2state_on=50_off=50" # From user snippet, for output directory AND config
 Comments = ""  # From user snippet
 
 # --- Unit System ---
@@ -43,11 +42,11 @@ nparticle = 32
 xmax = lattice_constant 
 mass = 4.2 
 
-# --- Trap Parameters ---
-ktrap =10.0
-e = 0.1  
-deltat_on = 80.0 / tt 
-deltat_off = 20.0 / tt 
+# --- Trap Parameters (Time-Dependent) ---
+ktrap = 10.0
+e = 2.0  # E = A sin(w x)/(1 + e + cos(w x))   
+deltat_on = 50.0 / tt 
+deltat_off = 50.0 / tt 
 N = 5      
 phi0 = 0.0  
 
@@ -176,8 +175,7 @@ function correct_trap_energy(current_cell::UnitCell, current_interactions::Inter
 end
 
 function debug_energy_calculation(current_cell::UnitCell, current_interactions::Interactions, current_step::Int)
-    #calculated_trap_energy = correct_trap_energy(current_cell, current_interactions)
-    calculated_trap_energy = cell_energy(current_cell, current_interactions) 
+    calculated_trap_energy = correct_trap_energy(current_cell, current_interactions)
     if mod(current_step, debug_print_sequence) == 0 
         original_elastic_energy = cell_energy(current_cell, current_interactions) 
         println("DEBUG_ENERGY @ step $(current_step): Elastic.cell_energy=$(@sprintf("%.6e", original_elastic_energy)), " *
@@ -344,27 +342,6 @@ trajsavecount = 0
 power_recording_interval = 100  # 每隔多少步记录一次功率
 power_history = Vector{Tuple{Float64, Float64, Bool}}()  # (时间, 平均功率, 陷阱是否开启)
 
-# 在全局变量区域添加以下变量声明（在其他全局变量之后）
-# 使用轨迹采样计算势能变化期望值
-trajectory_sample_interval = 100  # 每隔多少步采样一个轨迹起始点
-trajectory_sample_taus = 10000:100:100000  # 采样的时间窗口列表（步数）
-trajectory_samples = Dict{Int, Tuple{Float64, Vector{Vector{Float64}}, Float64}}()  # step => (time, positions, potential)
-delta_V_samples = Dict{Int, Vector{Float64}}()  # tau => [ΔV值数组]
-
-# 初始化存储结构
-for tau in trajectory_sample_taus
-    delta_V_samples[tau] = Float64[]
-end
-
-# 在全局变量声明区域添加势能记录相关变量
-potential_recording_interval = 100  # 与功率记录使用相同间隔
-potential_history = Vector{Tuple{Float64, Float64}}()  # (时间, 总势能)
-initial_potential_energy = Ref{Float64}(0.0)  # 初始势能
-final_potential_energy = Ref{Float64}(0.0)    # 最终势能
-
-# 在主循环开始之前记录初始势能
-initial_potential_energy[] = debug_energy_calculation(cell, interactions, 0)
-
 println("\nStarting simulation loop...")
 log_file_path = joinpath(basepath_actual_run, "log.txt")
 open(log_file_path, "w") do logfile
@@ -413,67 +390,6 @@ open(log_file_path, "w") do logfile
             tn_cycle = mod(current_trap_time, (deltat_on + deltat_off))
             trap_is_on = tn_cycle < deltat_on
             push!(power_history, (current_time, avg_power_this_step, trap_is_on))
-        end
-
-        # 计算当前势能
-        current_potential_energy = debug_energy_calculation(cell, interactions, step_sim)
-        
-        # 记录势能历史
-        if mod(step_sim, potential_recording_interval) == 0
-            current_time = step_sim * dt
-            push!(potential_history, (current_time, current_potential_energy))
-        end
-        
-        # 在最后一步记录最终势能
-        if step_sim == maxstep
-            final_potential_energy[] = current_potential_energy
-        end
-
-        # 仅在热平衡后进行轨迹采样
-        if step_sim > warm_up_steps
-            # 每隔固定步数保存当前系统状态作为轨迹采样点
-            if mod(step_sim, trajectory_sample_interval) == 0
-                current_time = step_sim * dt
-                
-                # 记录所有粒子的位置
-                positions_snapshot = Vector{Vector{Float64}}()
-                for i in 1:nparticle
-                    position_fractional = SVector{3,Float64}(cell.atoms[i].position)
-                    position_cartesian = Matrix(lattice_vectors) * position_fractional
-                    push!(positions_snapshot, convert(Vector{Float64}, position_cartesian))
-                end
-                
-                # 保存当前状态作为轨迹点
-                trajectory_samples[step_sim] = (current_time, deepcopy(positions_snapshot), current_potential_energy)
-                
-                # 对每个时间窗口tau，查找相应的过去轨迹点并计算势能差
-                for tau_steps in trajectory_sample_taus
-                    past_step = step_sim - tau_steps
-                    if haskey(trajectory_samples, past_step)
-                        past_data = trajectory_samples[past_step]
-                        past_time = past_data[1]
-                        past_positions = past_data[2]
-                        past_potential = past_data[3]
-                        
-                        # 计算势能差 ΔV = V(x(t+τ),t+τ) - V(x(t),t)
-                        delta_V = current_potential_energy - past_potential
-                        push!(delta_V_samples[tau_steps], delta_V)
-                        
-                        # 可选：保存精确计算的势能差（不使用store的值，而是重新计算）
-                        # 如果需要更高精度，可以启用这段代码
-                        # exact_past_potential = calculate_exact_potential(past_positions, past_time)
-                        # exact_current_potential = calculate_exact_potential(positions_snapshot, current_time)
-                        # exact_delta_V = exact_current_potential - exact_past_potential
-                        # push!(delta_V_samples[tau_steps], exact_delta_V)
-                    end
-                end
-                
-                # 清理太旧的数据以节省内存
-                old_steps = [s for s in keys(trajectory_samples) if step_sim - s > maximum(trajectory_sample_taus) + 100]
-                for old_step in old_steps
-                    delete!(trajectory_samples, old_step)
-                end
-            end
         end
 
         if step_sim > warm_up_steps
@@ -610,292 +526,7 @@ else
     println("         Sigma calculation (based on trap power) skipped. Check warm_up_steps ($warm_up_steps) vs maxstep ($maxstep).")
 end
 
-# 在模拟结束后，替换现有的熵产计算代码
-if steady_state_steps_count[] > 0
-    # 1. 计算基于功率的熵产率（保留原始计算）
-    avg_total_trap_power_input = total_power_diss_stable[] / steady_state_steps_count[]
-    avg_single_particle_trap_power_input = avg_total_trap_power_input / nparticle
-    beta = 1.0 / (kB_value * Ts)
-    power_term = beta * avg_single_particle_trap_power_input
-    
-    # 2. 使用轨迹采样计算势能变化期望值<ΔV(x(t),t)>
-    println("\n--- 轨迹采样势能变化分析 ---")
-    valid_taus = Int[]
-    mean_delta_Vs = Float64[]
-    tau_times = Float64[]  # 实际时间单位
-    
-    for tau in sort(collect(keys(delta_V_samples)))
-        samples = delta_V_samples[tau]
-        if length(samples) >= 30  # 确保有足够的样本进行统计
-            tau_time = tau * dt  # 转换为时间单位
-            mean_delta_V = mean(samples) / nparticle  # 每粒子平均
-            std_delta_V = std(samples) / nparticle
-            std_err = std_delta_V / sqrt(length(samples))
-            
-            push!(valid_taus, tau)
-            push!(mean_delta_Vs, mean_delta_V)
-            push!(tau_times, tau_time)
-            
-            println("τ = $(tau_time) 时间单位 ($(length(samples))个样本):")
-            println("  平均势能变化/粒子: $(mean_delta_V) ± $(std_err)")
-        end
-    end
-    
-    # 3. 对势能变化与时间窗口τ拟合线性关系，斜率即为势能变化率
-    if length(valid_taus) >= 3
-        # 拟合 ΔV = a + b·τ
-        # 注意：这里b就是势能变化率，但不是通过曲线拟合得到，而是通过大量轨迹点对计算
-        model(x, p) = p[1] .+ p[2] .* x
-        p0 = [0.0, 0.0]  # 初始参数猜测
-        
-        fit = curve_fit(model, tau_times, mean_delta_Vs, p0)
-        a, b = coef(fit)
-        
-        # 势能变化率 (ΔV/τ)
-        potential_change_rate = b  # 每单位时间的势能变化率
-        
-        # 势能变化对熵产的贡献 <ΔV>/T
-        potential_contribution = potential_change_rate / Ts
-        
-        # 4. 计算修正后的熵产率: σ = βP - <ΔV>/T
-        corrected_sigma = power_term - potential_contribution
-        
-        println("\n--- 基于轨迹采样的修正熵产率 ---")
-        println("功率项 (βP): $power_term")
-        println("势能变化率 (从轨迹采样): $potential_change_rate")
-        println("势能对熵产的贡献 (<ΔV>/T): $potential_contribution")
-        println("原始熵产率 (仅基于功率): $(power_term)")
-        println("修正熵产率 (σ = βP - <ΔV>/T): $corrected_sigma")
-        
-        # 5. 保存修正后的熵产率结果
-        corrected_sigma_filepath = joinpath(basepath_actual_run, "tur_summary_corrected.txt")
-        open(corrected_sigma_filepath, "w") do file
-            write(file, "TUR Analysis Summary (with trajectory sampling correction)\n")
-            write(file, "-----------------------------------------------------\n")
-            write(file, "Beta (1/kBT): $beta\n")
-            write(file, "Power term (βP): $power_term\n")
-            write(file, "Potential energy change rate (from trajectory sampling): $potential_change_rate\n")
-            write(file, "Potential contribution to entropy (<ΔV>/T): $potential_contribution\n")
-            write(file, "Corrected entropy production rate (σ): $corrected_sigma\n")
-            write(file, "Original entropy production rate (power-only): $(power_term)\n")
-            write(file, "Number of τ values analyzed: $(length(valid_taus))\n")
-            write(file, "Number of trajectory samples: $(sum([length(samples) for samples in values(delta_V_samples)]))\n")
-        end
-        println("修正后的熵产率结果已保存至: $corrected_sigma_filepath")
-        
-        # 6. 可视化势能变化与τ关系
-        fig_dir = joinpath(basepath_actual_run, "fig")
-        if !isdir(fig_dir)
-            mkpath(fig_dir)
-        end
-        
-        p_delta_v = plot(
-            title="Average Potential Energy Change vs τ",
-            xlabel="Time window τ [LJ units]",
-            ylabel="⟨ΔV(x(τ),τ)⟩/N [LJ units/particle]",
-            dpi=300,
-            legend=:topright
-        )
-        
-        # 绘制轨迹采样计算的势能变化数据点
-        scatter!(p_delta_v, tau_times, mean_delta_Vs, 
-                label="Trajectory samples", 
-                markersize=6)
-        
-        # 添加拟合线
-        fit_x = range(minimum(tau_times), maximum(tau_times), length=100)
-        fit_y = model(fit_x, coef(fit))
-        plot!(p_delta_v, fit_x, fit_y, 
-              linewidth=2, 
-              color=:red, 
-              label="Fit: $(round(a, digits=4)) + $(round(b, digits=6))·τ")
-        
-        # 保存图表
-        delta_v_path = joinpath(fig_dir, "potential_energy_change_vs_tau_sampled.png")
-        savefig(p_delta_v, delta_v_path)
-        println("势能变化与τ关系图已保存至: $delta_v_path")
-        
-        # 7. 绘制某个τ值的势能变化分布直方图
-        # 选择中间值的τ
-        mid_tau_idx = div(length(valid_taus), 2) + 1
-        if mid_tau_idx > 0 && mid_tau_idx <= length(valid_taus)
-            mid_tau = valid_taus[mid_tau_idx]
-            mid_tau_time = mid_tau * dt
-            mid_samples = delta_V_samples[mid_tau] ./ nparticle  # 转换为每粒子
-            
-            p_hist = histogram(mid_samples,
-                      bins=30,
-                      title="ΔV Distribution (τ = $mid_tau_time)",
-                      xlabel="ΔV per particle [LJ units]",
-                      ylabel="Frequency",
-                      legend=:topright,
-                      dpi=300)
-            
-            # 添加平均值线
-            vline!(p_hist, [mean(mid_samples)], 
-                  linewidth=2, 
-                  color=:red, 
-                  label="Mean: $(round(mean(mid_samples), digits=4))")
-            
-            # 保存直方图
-            hist_path = joinpath(fig_dir, "potential_energy_change_dist.png")
-            savefig(p_hist, hist_path)
-            println("势能变化分布直方图已保存至: $hist_path")
-        end
-    else
-        println("警告: 没有足够的τ值数据进行分析（需要至少3个）")
-    end
-else
-    println("警告: 没有稳态步骤数据用于分析")
-end
-
-# 主循环中的采样代码不变，但在分析部分进行修改
-
-# 在模拟结束后，替换原有的熵产计算代码，使用正确的系综平均
-if steady_state_steps_count[] > 0
-    # 1. 计算基于功率的熵产率（保留原始计算）
-    avg_total_trap_power_input = total_power_diss_stable[] / steady_state_steps_count[]
-    avg_single_particle_trap_power_input = avg_total_trap_power_input / nparticle
-    beta = 1.0 / (kB_value * Ts)
-    power_term = beta * avg_single_particle_trap_power_input
-    
-    # 2. 使用轨迹采样计算势能变化期望值<ΔV(x(t),t)>
-    println("\n--- 轨迹采样势能变化分析（系综平均）---")
-    valid_taus = Int[]
-    mean_delta_Vs = Float64[]
-    tau_times = Float64[]  # 实际时间单位
-    dv_by_tau_values = Float64[]  # 用于存储ΔV/τ值
-    
-    for tau in sort(collect(keys(delta_V_samples)))
-        samples = delta_V_samples[tau]
-        if length(samples) >= 30  # 确保有足够的样本进行统计
-            tau_time = tau * dt  # 转换为时间单位
-            mean_delta_V = mean(samples) / nparticle  # 每粒子平均
-            std_delta_V = std(samples) / nparticle
-            std_err = std_delta_V / sqrt(length(samples))
-            
-            # 重要：计算ΔV/τ比值，这是势能变化率的直接估计
-            dv_by_tau = mean_delta_V / tau_time
-            
-            push!(valid_taus, tau)
-            push!(mean_delta_Vs, mean_delta_V)
-            push!(tau_times, tau_time)
-            push!(dv_by_tau_values, dv_by_tau)
-            
-            println("τ = $(tau_time) 时间单位 ($(length(samples))个样本):")
-            println("  平均势能变化/粒子: $(mean_delta_V) ± $(std_err)")
-            println("  势能变化率 ΔV/τ: $(dv_by_tau)")
-        end
-    end
-     # 3. 计算势能变化率的平均值（系综平均，不是线性拟合）
-     if length(dv_by_tau_values) >= 3
-        # 使用所有τ计算的ΔV/τ的平均值作为势能变化率
-        potential_change_rate = mean(dv_by_tau_values)
-        # 计算标准误差
-        potential_change_rate_err = std(dv_by_tau_values) / sqrt(length(dv_by_tau_values))
-        
-        # 势能变化对熵产的贡献 <ΔV>/T
-        potential_contribution = potential_change_rate / Ts
-        
-        # 4. 计算修正后的熵产率: σ = βP - <ΔV>/T
-        corrected_sigma = power_term - potential_contribution
-        
-        println("\n--- 基于轨迹系综采样的修正熵产率 ---")
-        println("功率项 (βP): $power_term")
-        println("势能变化率 (轨迹系综平均): $potential_change_rate ± $potential_change_rate_err")
-        println("势能对熵产的贡献 (<ΔV>/T): $potential_contribution")
-        println("原始熵产率 (仅基于功率): $(power_term)")
-        println("修正熵产率 (σ = βP - <ΔV>/T): $corrected_sigma")
-        
-        # 5. 保存修正后的熵产率结果
-        corrected_sigma_filepath = joinpath(basepath_actual_run, "tur_summary_corrected.txt")
-        open(corrected_sigma_filepath, "w") do file
-            write(file, "TUR Analysis Summary (with trajectory ensemble sampling correction)\n")
-            write(file, "-----------------------------------------------------\n")
-            write(file, "Beta (1/kBT): $beta\n")
-            write(file, "Power term (βP): $power_term\n")
-            write(file, "Potential energy change rate (ensemble average): $potential_change_rate ± $potential_change_rate_err\n")
-            write(file, "Potential contribution to entropy (<ΔV>/T): $potential_contribution\n")
-            write(file, "Corrected entropy production rate (σ): $corrected_sigma\n")
-            write(file, "Original entropy production rate (power-only): $(power_term)\n")
-            write(file, "Number of τ values analyzed: $(length(valid_taus))\n")
-            write(file, "Total number of trajectory samples: $(sum([length(samples) for samples in values(delta_V_samples)]))\n")
-            write(file, "Calculation method: Ensemble average of ΔV/τ across multiple τ values\n")
-        end
-        println("修正后的熵产率结果已保存至: $corrected_sigma_filepath")
-        
-        # 6. 可视化势能变化与τ关系以及ΔV/τ值
-        fig_dir = joinpath(basepath_actual_run, "fig")
-        if !isdir(fig_dir)
-            mkpath(fig_dir)
-        end
-        
-        # 绘制ΔV与τ的关系
-        p_delta_v = plot(
-            title="Average Potential Energy Change vs τ",
-            xlabel="Time window τ [LJ units]",
-            ylabel="⟨ΔV(x(τ),τ)⟩/N [LJ units/particle]",
-            dpi=300,
-            legend=:topright
-        )
-        
-        # 绘制轨迹采样计算的势能变化数据点
-        scatter!(p_delta_v, tau_times, mean_delta_Vs, 
-                label="Trajectory samples", 
-                markersize=6)
-        
-        # 添加一条通过原点的线，斜率为平均势能变化率
-        plot!(p_delta_v, [0; maximum(tau_times)], [0; potential_change_rate * maximum(tau_times)], 
-              linewidth=2, 
-              color=:red, 
-              label="Ensemble average rate: $(round(potential_change_rate, digits=6))")
-        
-        # 保存图表
-        delta_v_path = joinpath(fig_dir, "potential_energy_change_vs_tau_ensemble.png")
-        savefig(p_delta_v, delta_v_path)
-        println("势能变化与τ关系图已保存至: $delta_v_path")
-        
-        # 7. 绘制ΔV/τ与τ的关系图，应当是一条水平线
-        p_rate = plot(
-            title="Potential Energy Change Rate vs τ",
-            xlabel="Time window τ [LJ units]",
-            ylabel="⟨ΔV(x(τ),τ)⟩/(τ·N) [LJ units/time/particle]",
-            dpi=300,
-            legend=:topright
-        )
-        
-        # 绘制每个τ对应的ΔV/τ值
-        scatter!(p_rate, tau_times, dv_by_tau_values, 
-                label="ΔV/τ samples", 
-                markersize=6)
-        
-        # 添加平均ΔV/τ的水平线
-        hline!(p_rate, [potential_change_rate], 
-               linewidth=2, 
-               color=:red, 
-               label="Mean rate: $(round(potential_change_rate, digits=6))")
-        
-        # 添加误差区间
-        plot!(p_rate, tau_times, fill(potential_change_rate + potential_change_rate_err, length(tau_times)), 
-              fillrange=fill(potential_change_rate - potential_change_rate_err, length(tau_times)),
-              fillalpha=0.2, 
-              color=:red, 
-              label="±standard error")
-        
-        # 保存图表
-        rate_path = joinpath(fig_dir, "potential_energy_change_rate_vs_tau.png")
-        savefig(p_rate, rate_path)
-        println("势能变化率与τ关系图已保存至: $rate_path")
-    else
-        println("警告: 没有足够的τ值数据进行分析（需要至少3个）")
-    end
-else
-    println("警告: 没有稳态步骤数据用于分析")
-end
-
-
-
-
+println("\nScript execution finished.")
 
 # --- (可选) 添加绘制完整轨迹的函数 (来自用户脚本) ---
 function plot_complete_trajectory(output_basepath_func::String) 
@@ -1158,16 +789,5 @@ if !isempty(power_history)
         positive_stable = stable_powers .> 0
         println("热平衡后正功率比例: $(100 * sum(positive_stable) / length(stable_powers))%")
     end
-end
-
-# 在全局变量区域保留这些声明
-trajectory_sample_interval = 100  # 每隔多少步采样一个轨迹起始点
-trajectory_sample_taus = [100, 500, 1000, 2000, 4000]  # 采样的时间窗口列表（步数）
-trajectory_samples = Dict{Int, Tuple{Float64, Vector{Vector{Float64}}, Float64}}()  # step => (time, positions, potential)
-delta_V_samples = Dict{Int, Vector{Float64}}()  # tau => [ΔV值数组]
-
-# 初始化存储结构
-for tau in trajectory_sample_taus
-    delta_V_samples[tau] = Float64[]
 end
 
